@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-GMT SBOM Exporter - Phase 1: CycloneDX Basis
-=============================================
+GMT SBOM Exporter - Phase 1-3: CycloneDX Basis + Energy + Lizenzen
+====================================================================
 Generiert ein CycloneDX 1.6 SBOM aus den container_dependencies eines GMT-Runs.
 
 Verwendung:
     python tools/sbom_exporter.py --run-id <uuid>
     python tools/sbom_exporter.py --run-id <uuid> --output sbom.json
+    python tools/sbom_exporter.py --run-id <uuid> --no-licenses
     python tools/sbom_exporter.py --list-runs
 """
 
 import sys
 import re
 import argparse
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
+import json as json_mod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # GMT-Root ins sys.path damit lib-Importe funktionieren
@@ -127,12 +133,299 @@ def make_purl(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: Lizenz-Lookup via externe Paketregistry-APIs
+# ---------------------------------------------------------------------------
+
+_LICENSE_CACHE: dict[str, str | None] = {}  # "type:name@version" → SPDX-String oder None
+
+_HTTP_TIMEOUT = 4  # Sekunden pro Request
+
+
+def _http_get(url: str) -> bytes | None:
+    """Einfacher HTTP-GET mit Timeout. Gibt None bei Fehler zurück."""
+    try:
+        with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def _fetch_pypi(name: str, version: str) -> str | None:
+    """PyPI JSON API → info.license, Fallback: License-Classifiers"""
+    data = _http_get(f'https://pypi.org/pypi/{name}/{version}/json')
+    if not data:
+        return None
+    try:
+        info = json_mod.loads(data).get('info', {})
+        # 1. Direktes Lizenzfeld (z.B. "MIT", "Apache-2.0")
+        lic = (info.get('license') or '').strip()
+        if lic:
+            return lic
+        # 2. Fallback: PyPI-Classifiers
+        #    "License :: OSI Approved :: MIT License" → "MIT License"
+        #    "License :: OSI Approved :: Apache Software License" → "Apache Software License"
+        for classifier in info.get('classifiers', []):
+            if classifier.startswith('License :: OSI Approved :: '):
+                return classifier.split(' :: ')[-1]
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_npm(name: str, version: str) -> str | None:
+    """npm Registry API → license"""
+    data = _http_get(f'https://registry.npmjs.org/{name}/{version}')
+    if not data:
+        return None
+    try:
+        lic = json_mod.loads(data).get('license')
+        if isinstance(lic, dict):
+            return lic.get('type')
+        return lic or None
+    except Exception:
+        return None
+
+
+def _fetch_composer(name: str, version: str) -> str | None:
+    """Packagist API → license[]"""
+    # composer name ist vendor/package
+    data = _http_get(f'https://packagist.org/packages/{name}.json')
+    if not data:
+        return None
+    try:
+        pkgs = json_mod.loads(data).get('package', {}).get('versions', {})
+        # Version mit oder ohne 'v'-Prefix suchen
+        for key in (version, f'v{version}'):
+            entry = pkgs.get(key, {})
+            if entry:
+                licenses = entry.get('license', [])
+                return ' AND '.join(licenses) if licenses else None
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_maven(name: str, version: str) -> str | None:
+    """Maven Central POM XML → <licenses><license><name>"""
+    # name ist typisch "group:artifact" oder nur "artifact"
+    parts = name.split(':')
+    if len(parts) == 2:
+        group, artifact = parts
+    else:
+        return None
+    group_path = group.replace('.', '/')
+    url = f'https://repo1.maven.org/maven2/{group_path}/{artifact}/{version}/{artifact}-{version}.pom'
+    data = _http_get(url)
+    if not data:
+        return None
+    try:
+        root = ET.fromstring(data)
+        ns = {'m': 'http://maven.apache.org/POM/4.0.0'}
+        names = [e.text for e in root.findall('.//m:license/m:name', ns) if e.text]
+        if not names:
+            # ohne Namespace versuchen
+            names = [e.text for e in root.findall('.//license/name') if e.text]
+        return ' AND '.join(names) if names else None
+    except Exception:
+        return None
+
+
+def _fetch_pecl(name: str, _version: str) -> str | None:
+    """PECL REST API → license"""
+    data = _http_get(f'https://pecl.php.net/rest/p/{name}/info.xml')
+    if not data:
+        return None
+    try:
+        root = ET.fromstring(data)
+        # Namespace ignorieren
+        for child in root.iter():
+            if child.tag.endswith('license') and child.text:
+                return child.text.strip()
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_alpine(name: str, version: str, distro: str = 'edge') -> str | None:
+    """Alpine Linux packages HTML → license (kein JSON-API verfügbar)"""
+    # distro ist z.B. "alpine-3.23" → branch "v3.23"
+    # version ist Paket-Version "1.2.3-r0", enthält keine Distro-Info
+    m = re.match(r'alpine-(\d+)\.(\d+)', distro)
+    branch = f'v{m.group(1)}.{m.group(2)}' if m else 'edge'
+    data = _http_get(f'https://pkgs.alpinelinux.org/packages?name={name}&branch={branch}')
+    if not data:
+        return None
+    try:
+        html = data.decode('utf-8', errors='replace')
+        # HTML: <td class="license"><span class="hint--right" aria-label="MIT">MIT</span></td>
+        m2 = re.search(r'<td class="license">\s*<span[^>]*>\s*([^<]+?)\s*</span>', html)
+        return m2.group(1).strip() if m2 else None
+    except Exception:
+        return None
+
+
+def _fetch_debian(name: str, _version: str) -> str | None:
+    """Debian/Ubuntu: kein zuverlässiges REST-API → Known Unknown"""
+    return None
+
+
+# Erweiterbare Map: purl-type → Fetch-Funktion
+# Neue Paketmanager hier eintragen (cargo, gem, golang, nuget, ...)
+LICENSE_FETCHERS: dict[str, callable] = {
+    'pypi':     _fetch_pypi,
+    'npm':      _fetch_npm,
+    'composer': _fetch_composer,
+    'maven':    _fetch_maven,
+    'pecl':     _fetch_pecl,
+    'apk':      _fetch_alpine,
+    'deb':      _fetch_debian,
+    # Zukünftig:
+    # 'cargo':   _fetch_crates_io,
+    # 'gem':     _fetch_rubygems,
+    # 'golang':  _fetch_pkg_go_dev,
+    # 'nuget':   _fetch_nuget,
+}
+
+
+def _cache_key(purl_type: str, name: str, version: str) -> str:
+    return f'{purl_type}:{name}@{version}'
+
+
+def fetch_license(purl_type: str, name: str, version: str, **kwargs) -> str | None:
+    """
+    Fragt die Lizenz eines Pakets via externe Registry-API ab.
+    Ergebnis wird in-memory gecacht (pro Exporter-Aufruf).
+
+    kwargs werden an den Fetcher weitergegeben (z.B. distro='alpine-3.23' für apk).
+    """
+    key = _cache_key(purl_type, name, version)
+    if key in _LICENSE_CACHE:
+        return _LICENSE_CACHE[key]
+
+    fetcher = LICENSE_FETCHERS.get(purl_type)
+    if fetcher is None:
+        result = None
+    else:
+        try:
+            result = fetcher(name, version, **kwargs)
+        except TypeError:
+            result = fetcher(name, version)  # Fetcher unterstützt kwargs nicht
+
+    _LICENSE_CACHE[key] = result
+    return result
+
+
+def fetch_licenses_parallel(
+    packages: list[tuple],  # [(purl_type, name, version, **kwargs), ...]
+    max_workers: int = 10,
+) -> dict[str, str | None]:
+    """
+    Fragt Lizenzen für mehrere Pakete parallel ab.
+    Jeder Eintrag ist (purl_type, name, version) oder (purl_type, name, version, extra_kwargs).
+    Gibt Dict {cache_key → license_string} zurück.
+    """
+    results: dict[str, str | None] = {}
+    todo = []
+    for item in packages:
+        purl_type, name, version = item[0], item[1], item[2]
+        extra = item[3] if len(item) > 3 else {}
+        key = _cache_key(purl_type, name, version)
+        if key in _LICENSE_CACHE:
+            results[key] = _LICENSE_CACHE[key]
+        else:
+            todo.append((purl_type, name, version, extra, key))
+
+    if not todo:
+        return results
+
+    def _fetch_one(args):
+        purl_type, name, version, extra, key = args
+        return key, fetch_license(purl_type, name, version, **extra)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for key, lic in ex.map(_fetch_one, todo):
+            results[key] = lic
+
+    return results
+
+
+def apply_licenses_to_components(
+    components: list[Component],
+    purls: list[PackageURL | None],
+    fetch_licenses: bool = True,
+) -> int:
+    """
+    Fragt Lizenzen für alle Komponenten ab und fügt sie als component.licenses ein.
+    Gibt Anzahl erfolgreich aufgelöster Lizenzen zurück.
+
+    Für apk-Pakete wird der distro-Qualifier aus dem PURL extrahiert und
+    an den Alpine-Fetcher weitergegeben (Branch-Auflösung).
+    """
+    if not fetch_licenses:
+        return 0
+
+    # Pakete für Parallel-Lookup sammeln
+    # Eintrag: (purl_type, name, version, extra_kwargs, idx)
+    lookup: list[tuple] = []
+    for idx, (comp, purl) in enumerate(zip(components, purls)):
+        if purl and comp.version:
+            extra: dict = {}
+            if purl.type == 'apk' and purl.qualifiers:
+                # qualifiers ist dict oder str; PackageURL parst zu dict
+                q = purl.qualifiers if isinstance(purl.qualifiers, dict) else {}
+                if 'distro' in q:
+                    extra['distro'] = q['distro']
+            lookup.append((purl.type, purl.name, comp.version, extra, idx))
+
+    if not lookup:
+        return 0
+
+    print(f'  Lizenzen abrufen: {len(lookup)} Pakete ...', file=sys.stderr)
+    pkg_items = [(t, n, v, e) for t, n, v, e, _ in lookup]
+    license_map = fetch_licenses_parallel(pkg_items)
+
+    resolved = 0
+    for purl_type, name, version, extra, idx in lookup:
+        key = _cache_key(purl_type, name, version)
+        lic_str = license_map.get(key)
+
+        comp = components[idx]
+        if lic_str:
+            try:
+                # In cyclonedx-python-lib v11:
+                #   LicenseExpression(value=...)   → SPDX-Ausdruck (z.B. "MIT", "Apache-2.0")
+                #   DisjunctiveLicense(name=...)   → Freitext-Lizenzname (nicht-SPDX)
+                # LicenseRepository (SortedSet) nimmt beide via .add()
+                from cyclonedx.model.license import LicenseExpression, DisjunctiveLicense
+                try:
+                    comp.licenses.add(LicenseExpression(value=lic_str))
+                except Exception:
+                    comp.licenses.add(DisjunctiveLicense(name=lic_str))
+                resolved += 1
+            except Exception:
+                pass
+        else:
+            # Known Unknown: keine Lizenz via API ermittelbar
+            comp.properties.add(Property(
+                name='green-coding:license-missing-reason',
+                value=f'kein API-Zugriff für purl-type: {purl_type}',
+            ))
+
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Hauptlogik: container_dependencies → CycloneDX-Komponenten
 # ---------------------------------------------------------------------------
 
-def parse_container_deps(container_deps: dict) -> list[Component]:
+def parse_container_deps(
+    container_deps: dict,
+) -> tuple[list[Component], list[PackageURL | None]]:
     """
     Wandelt container_dependencies (JSONB aus GMT DB) in CycloneDX-Komponenten um.
+
+    Gibt (components, purls) zurück — beide Listen haben gleiche Länge und gleiche
+    Reihenfolge, damit apply_licenses_to_components purl-Typ + Name zuordnen kann.
 
     Struktur der Eingabe:
         {
@@ -148,6 +441,7 @@ def parse_container_deps(container_deps: dict) -> list[Component]:
         }
     """
     components: list[Component] = []
+    purls: list[PackageURL | None] = []
     seen_purls: set[str] = set()  # Duplikate über Container hinweg vermeiden
 
     for container_name, container_data in container_deps.items():
@@ -203,8 +497,9 @@ def parse_container_deps(container_deps: dict) -> list[Component]:
                         pass  # Hash-API kann sich je nach cyclonedx-version unterscheiden
 
                 components.append(component)
+                purls.append(purl)
 
-    return components
+    return components, purls
 
 
 def enrich_metadata(bom: Bom, run: dict, container_deps: dict) -> None:
@@ -371,7 +666,7 @@ def add_energy_to_bom(bom: Bom, energy_rows: list[dict]) -> int:
     return count
 
 
-def build_bom(run_id: str) -> tuple[Bom, dict]:
+def build_bom(run_id: str, fetch_licenses: bool = True) -> tuple[Bom, dict]:
     """Liest einen GMT-Run aus der DB und erzeugt ein CycloneDX BOM."""
     db = DB()
 
@@ -395,7 +690,7 @@ def build_bom(run_id: str) -> tuple[Bom, dict]:
 
     bom = Bom()
     container_deps = run['container_dependencies']
-    components = parse_container_deps(container_deps)
+    components, purls = parse_container_deps(container_deps)
 
     for c in components:
         bom.components.add(c)
@@ -406,6 +701,9 @@ def build_bom(run_id: str) -> tuple[Bom, dict]:
     energy_rows = fetch_energy_metrics(run_id)
     energy_count = add_energy_to_bom(bom, energy_rows)
 
+    # Phase 3: Lizenzen via externe Paketregistry-APIs
+    license_count = apply_licenses_to_components(components, purls, fetch_licenses)
+
     # -----------------------------------------------------------------------
     # NTIA Known Unknowns:
     # Abhängigkeitsbeziehungen (direkt vs. transitiv) sind in Phase 1 NICHT
@@ -414,12 +712,13 @@ def build_bom(run_id: str) -> tuple[Bom, dict]:
     # -----------------------------------------------------------------------
 
     meta = {
-        'run_id':        str(run['id']),
-        'run_name':      run.get('name', ''),
-        'created_at':    str(run.get('created_at', '')),
-        'uri':           run.get('uri', ''),
-        'components':    len(components),
+        'run_id':         str(run['id']),
+        'run_name':       run.get('name', ''),
+        'created_at':     str(run.get('created_at', '')),
+        'uri':            run.get('uri', ''),
+        'components':     len(components),
         'energy_metrics': energy_count,
+        'licenses':       license_count,
     }
 
     return bom, meta
@@ -458,6 +757,10 @@ def main():
     parser.add_argument('--run-id', help='GMT Run UUID')
     parser.add_argument('--output', '-o', help='Ausgabedatei (Standard: stdout)')
     parser.add_argument('--list-runs', action='store_true', help='Alle Runs mit Deps auflisten')
+    parser.add_argument(
+        '--no-licenses', action='store_true',
+        help='Lizenz-Lookup via externe APIs überspringen (schneller, offline-fähig)',
+    )
     args = parser.parse_args()
 
     if args.list_runs:
@@ -467,7 +770,7 @@ def main():
     if not args.run_id:
         parser.error('--run-id ist erforderlich (oder --list-runs)')
 
-    bom, meta = build_bom(args.run_id)
+    bom, meta = build_bom(args.run_id, fetch_licenses=not args.no_licenses)
 
     outputter = JsonV1Dot6(bom)
     json_str = outputter.output_as_string(indent=2)
@@ -477,6 +780,7 @@ def main():
         print(f'SBOM geschrieben: {args.output}', file=sys.stderr)
         print(f'Komponenten:      {meta["components"]}', file=sys.stderr)
         print(f'Energiemetriken:  {meta["energy_metrics"]}', file=sys.stderr)
+        print(f'Lizenzen:         {meta["licenses"]}', file=sys.stderr)
         print(f'Run:              {meta["run_id"]}', file=sys.stderr)
         print(f'Erstellt:         {meta["created_at"]}', file=sys.stderr)
     else:
