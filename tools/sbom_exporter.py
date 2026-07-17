@@ -292,6 +292,85 @@ def enrich_metadata(bom: Bom, run: dict, container_deps: dict) -> None:
             bom.metadata.properties.add(Property(name=prop_name, value=prop_value))
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Energy Extension
+# ---------------------------------------------------------------------------
+
+def fetch_energy_metrics(run_id: str) -> list[dict]:
+    """
+    Liest alle Energie- und CO2-Metriken für einen Run aus der GMT-Datenbank.
+
+    Erfasst dynamisch alle Provider-Kombinationen (Linux RAPL, Windows Scaphandre,
+    PSU-Hardware, xgboost-Modell, GPU, macOS powermetrics, etc.) ohne Hardcoding
+    spezifischer Metriken — funktioniert auf allen GMT-Plattformen.
+
+    Filterkriterien:
+      - *_energy_*        → Energieverbrauch (typisch: uJ)
+      - *_carbon_*        → CO2-Emissionen (typisch: ugCO2e), OHNE carbon_intensity
+      - carbon_intensity_* → Kohlenstoffintensität (typisch: gCO2e/kWh)
+    """
+    db = DB()
+    rows = db.fetch_all(
+        '''
+        SELECT
+            mm.metric,
+            mm.detail_name,
+            mm.unit,
+            SUM(mv.value) AS total
+        FROM measurement_values mv
+        JOIN measurement_metrics mm ON mv.measurement_metric_id = mm.id
+        WHERE mm.run_id = %s
+          AND (
+              mm.metric LIKE '%%_energy_%%'
+              OR (mm.metric LIKE '%%_carbon_%%' AND mm.metric NOT LIKE 'carbon_intensity_%%')
+              OR mm.metric LIKE 'carbon_intensity_%%'
+          )
+        GROUP BY mm.metric, mm.detail_name, mm.unit
+        ORDER BY mm.metric, mm.detail_name
+        ''',
+        (run_id,),
+        fetch_mode='dict',
+    )
+    return rows or []
+
+
+def add_energy_to_bom(bom: Bom, energy_rows: list[dict]) -> int:
+    """
+    Fügt Energie- und CO2-Metriken als green-coding: Properties in die BOM-Metadaten ein.
+
+    Property-Schema:
+        green-coding:measurement:{metric}:{detail_name} = {total} {unit}
+
+    Beispiele:
+        green-coding:measurement:cpu_energy_rapl_msr_component:cpu_package = 2021536527 uJ
+        green-coding:measurement:psu_carbon_ac_xgboost_machine:[MACHINE] = 387411 ugCO2e
+        green-coding:measurement:carbon_intensity_static_machine:static = 342 gCO2e/kWh
+
+    Der detail_name kommt direkt aus der GMT-DB und identifiziert den Sub-Sensor
+    (z.B. CPU-Domain, Container-Name, Gerätebezeichnung).
+    """
+    count = 0
+    for row in energy_rows:
+        metric      = row['metric']
+        detail_name = row['detail_name'] or ''
+        unit        = row['unit'] or ''
+        total       = row['total']
+
+        # Wert als Integer wenn möglich (Energie-Werte sind immer ganzzahlig in GMT)
+        try:
+            value_str = str(int(total))
+        except (ValueError, TypeError):
+            value_str = str(round(float(total), 4))
+
+        prop_name  = f'green-coding:measurement:{metric}:{detail_name}'
+        prop_value = f'{value_str} {unit}'.strip()
+
+        bom.metadata.properties.add(Property(name=prop_name, value=prop_value))
+        count += 1
+
+    return count
+
+
 def build_bom(run_id: str) -> tuple[Bom, dict]:
     """Liest einen GMT-Run aus der DB und erzeugt ein CycloneDX BOM."""
     db = DB()
@@ -323,6 +402,10 @@ def build_bom(run_id: str) -> tuple[Bom, dict]:
 
     enrich_metadata(bom, run, container_deps)
 
+    # Phase 2: Energiedaten aus GMT-DB → green-coding: Properties
+    energy_rows = fetch_energy_metrics(run_id)
+    energy_count = add_energy_to_bom(bom, energy_rows)
+
     # -----------------------------------------------------------------------
     # NTIA Known Unknowns:
     # Abhängigkeitsbeziehungen (direkt vs. transitiv) sind in Phase 1 NICHT
@@ -331,11 +414,12 @@ def build_bom(run_id: str) -> tuple[Bom, dict]:
     # -----------------------------------------------------------------------
 
     meta = {
-        'run_id':     str(run['id']),
-        'run_name':   run.get('name', ''),
-        'created_at': str(run.get('created_at', '')),
-        'uri':        run.get('uri', ''),
-        'components': len(components),
+        'run_id':        str(run['id']),
+        'run_name':      run.get('name', ''),
+        'created_at':    str(run.get('created_at', '')),
+        'uri':           run.get('uri', ''),
+        'components':    len(components),
+        'energy_metrics': energy_count,
     }
 
     return bom, meta
@@ -392,6 +476,7 @@ def main():
         Path(args.output).write_text(json_str, encoding='utf-8')
         print(f'SBOM geschrieben: {args.output}', file=sys.stderr)
         print(f'Komponenten:      {meta["components"]}', file=sys.stderr)
+        print(f'Energiemetriken:  {meta["energy_metrics"]}', file=sys.stderr)
         print(f'Run:              {meta["run_id"]}', file=sys.stderr)
         print(f'Erstellt:         {meta["created_at"]}', file=sys.stderr)
     else:
