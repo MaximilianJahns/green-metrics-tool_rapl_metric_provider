@@ -14,6 +14,9 @@ Verwendung:
 import sys
 import re
 import argparse
+import io
+import tarfile
+import threading
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -137,17 +140,26 @@ def make_purl(
 # ---------------------------------------------------------------------------
 
 _LICENSE_CACHE: dict[str, str | None] = {}  # "type:name@version" → SPDX-String oder None
+_RESPONSE_CACHE: dict[str, bytes | None] = {}  # URL → rohe HTTP-Response (geteilt für License + Deps)
 
 _HTTP_TIMEOUT = 4  # Sekunden pro Request
 
 
 def _http_get(url: str) -> bytes | None:
-    """Einfacher HTTP-GET mit Timeout. Gibt None bei Fehler zurück."""
+    """HTTP-GET mit URL-Cache und Timeout. Gibt None bei Fehler zurück.
+
+    Der Response-Cache stellt sicher, dass Lizenz- und Dependency-Lookup
+    dieselbe API-Antwort teilen ohne Doppel-Requests.
+    """
+    if url in _RESPONSE_CACHE:
+        return _RESPONSE_CACHE[url]
     try:
         with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as r:
-            return r.read()
+            result: bytes | None = r.read()
     except Exception:
-        return None
+        result = None
+    _RESPONSE_CACHE[url] = result
+    return result
 
 
 def _fetch_pypi(name: str, version: str) -> str | None:
@@ -286,6 +298,319 @@ LICENSE_FETCHERS: dict[str, callable] = {
     # 'nuget':   _fetch_nuget,
 }
 
+
+# ---------------------------------------------------------------------------
+# Phase 4: Dependency Graph
+# ---------------------------------------------------------------------------
+
+def _normalize_pkg_name(name: str, purl_type: str) -> str:
+    """Normalisiert Paketnamen für Registry-übergreifenden Vergleich."""
+    n = name.lower()
+    if purl_type == 'pypi':
+        # PEP 503: Hyphens, underscores und Punkte sind äquivalent
+        return re.sub(r'[-_\.]+', '_', n)
+    return n
+
+
+def _deps_pypi(name: str, version: str) -> list[str]:
+    """PyPI requires_dist → Liste direkter Abhängigkeitsnamen."""
+    data = _http_get(f'https://pypi.org/pypi/{name}/{version}/json')
+    if not data:
+        return []
+    try:
+        requires = json_mod.loads(data).get('info', {}).get('requires_dist') or []
+        deps = []
+        for req in requires:
+            # Optionale Abhängigkeiten (extras) überspringen
+            if ';' in req and 'extra ==' in req.split(';')[1]:
+                continue
+            # Nur Paketnamen extrahieren (vor Versionsoperatoren)
+            pkg_name = re.split(r'[>=<!;\s\[\(]', req)[0].strip()
+            if pkg_name:
+                deps.append(_normalize_pkg_name(pkg_name, 'pypi'))
+        return deps
+    except Exception:
+        return []
+
+
+def _deps_npm(name: str, version: str) -> list[str]:
+    """npm registry dependencies dict → Liste direkter Abhängigkeitsnamen."""
+    data = _http_get(f'https://registry.npmjs.org/{name}/{version}')
+    if not data:
+        return []
+    try:
+        return list(json_mod.loads(data).get('dependencies', {}).keys())
+    except Exception:
+        return []
+
+
+def _deps_composer(name: str, version: str) -> list[str]:
+    """Packagist require dict → Liste direkter Abhängigkeitsnamen."""
+    data = _http_get(f'https://packagist.org/packages/{name}.json')
+    if not data:
+        return []
+    try:
+        pkgs = json_mod.loads(data).get('package', {}).get('versions', {})
+        for key in (version, f'v{version}'):
+            entry = pkgs.get(key, {})
+            if entry:
+                require = entry.get('require', {})
+                # php, ext-* und lib-* sind keine echten Pakete
+                return [
+                    k for k in require.keys()
+                    if not re.match(r'^(php|ext-|lib-)', k)
+                ]
+        return []
+    except Exception:
+        return []
+
+
+def _deps_maven(name: str, version: str) -> list[str]:
+    """Maven POM <dependencies> → Liste 'groupId:artifactId'."""
+    parts = name.split(':')
+    if len(parts) != 2:
+        return []
+    group, artifact = parts
+    group_path = group.replace('.', '/')
+    url = f'https://repo1.maven.org/maven2/{group_path}/{artifact}/{version}/{artifact}-{version}.pom'
+    data = _http_get(url)
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+        ns = {'m': 'http://maven.apache.org/POM/4.0.0'}
+        deps = []
+        for dep in root.findall('.//m:dependency', ns) or root.findall('.//dependency'):
+            scope_el = dep.find('m:scope', ns) or dep.find('scope')
+            if scope_el is not None and scope_el.text in ('test', 'provided', 'system'):
+                continue
+            g_el = dep.find('m:groupId', ns) or dep.find('groupId')
+            a_el = dep.find('m:artifactId', ns) or dep.find('artifactId')
+            if g_el is not None and a_el is not None and g_el.text and a_el.text:
+                deps.append(f'{g_el.text}:{a_el.text}')
+        return deps
+    except Exception:
+        return []
+
+
+def _deps_pecl(name: str, _version: str) -> list[str]:
+    """PECL info.xml <deps> → minimale Abhängigkeitsliste."""
+    data = _http_get(f'https://pecl.php.net/rest/p/{name}/info.xml')
+    if not data:
+        return []
+    try:
+        root = ET.fromstring(data)
+        deps = []
+        for child in root.iter():
+            if child.tag.endswith('}name') or child.tag == 'name':
+                parent_tag = child.tag.replace('{http://pear.php.net/dtd/rest.packageinfo}', '')
+                if parent_tag == 'name':
+                    continue  # das ist der Paketname selbst
+            # PECL deps sind oft in <d:dep><d:name>...</d:name></d:dep> Strukturen
+            # Zu komplex für einfaches Parsen — minimal halten
+        return deps
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Alpine APKINDEX-Cache (pro Branch einmalig geladen)
+# ---------------------------------------------------------------------------
+_APKINDEX_CACHE: dict[str, dict[str, list[str]]] = {}  # branch → {pkg → [deps]}
+_APKINDEX_LOCK = threading.Lock()
+
+
+def _load_apkindex(branch: str, arch: str = 'x86_64') -> dict[str, list[str]]:
+    """
+    Lädt Alpine APKINDEX.tar.gz für main + community und gibt
+    {pkg_name → [dep_pkg_names]} zurück.
+
+    APKINDEX-Format (Textdatei, Blöcke durch Leerzeilen getrennt):
+        P:apk-tools
+        V:3.0.6-r0
+        D:libapk=3.0.6-r0 so:libc.musl-x86_64.so.1 musl>=1.0
+
+    D:-Feld enthält:
+        - echte Paketnamen (evt. mit Versionsoperator: pkg>=1.0, pkg=1.0)
+        - so:libXYZ.so.1       → shared-library Referenz (kein Paketname)
+        - cmd:...              → Kommando-Referenz (kein Paketname)
+        - pc:...               → pkg-config Referenz (kein Paketname)
+    """
+    deps_map: dict[str, list[str]] = {}
+
+    for repo in ('main', 'community'):
+        url = (
+            f'https://dl-cdn.alpinelinux.org/alpine/{branch}'
+            f'/{repo}/{arch}/APKINDEX.tar.gz'
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                raw = r.read()
+        except Exception:
+            continue
+
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+                member = tf.extractfile('APKINDEX')
+                if not member:
+                    continue
+                text = member.read().decode('utf-8', errors='replace')
+        except Exception:
+            continue
+
+        for block in text.split('\n\n'):
+            pkg_name = None
+            pkg_deps: list[str] = []
+            for line in block.splitlines():
+                if line.startswith('P:'):
+                    pkg_name = line[2:].strip()
+                elif line.startswith('D:'):
+                    for token in line[2:].split():
+                        # Versionsoperator entfernen: libapk=3.0.6-r0 → libapk
+                        dep_name = re.split(r'[>=<!]', token)[0]
+                        # so:, cmd:, pc: etc. sind keine Paketnamen
+                        if ':' not in dep_name and dep_name:
+                            pkg_deps.append(dep_name)
+            if pkg_name:
+                deps_map[pkg_name] = pkg_deps
+
+    return deps_map
+
+
+def _deps_apk(name: str, _version: str, distro: str = 'edge') -> list[str]:
+    """
+    Alpine Paket-Abhängigkeiten via APKINDEX.tar.gz (einmalig pro Branch geladen).
+
+    Viel effizienter als HTML-Scraping: ein einziger HTTP-Request pro Branch
+    deckt alle Pakete in main + community ab.
+    """
+    m = re.match(r'alpine-(\d+)\.(\d+)', distro)
+    branch = f'v{m.group(1)}.{m.group(2)}' if m else 'edge'
+
+    if branch not in _APKINDEX_CACHE:
+        with _APKINDEX_LOCK:
+            if branch not in _APKINDEX_CACHE:   # Double-Check nach Lock-Erwerb
+                print(f'  APKINDEX laden: {branch} ...', file=sys.stderr)
+                _APKINDEX_CACHE[branch] = _load_apkindex(branch)
+
+    return _APKINDEX_CACHE[branch].get(name, [])
+
+
+# Erweiterbare Map: purl-type → Dependency-Fetcher
+# Neue Paketmanager hier eintragen (cargo, gem, golang, nuget, ...)
+DEP_FETCHERS: dict[str, callable] = {
+    'pypi':     _deps_pypi,
+    'npm':      _deps_npm,
+    'composer': _deps_composer,
+    'maven':    _deps_maven,
+    'apk':      _deps_apk,
+    # pecl: zu komplex für zuverlässiges Parsen
+    # deb: kein zuverlässiges REST-API für Dependency-Graph
+    # Zukünftig:
+    # 'cargo':  _deps_crates_io,
+    # 'gem':    _deps_rubygems,
+    # 'golang': _deps_pkg_go_dev,
+    # 'nuget':  _deps_nuget,
+}
+
+
+def build_dependency_graph(
+    bom,
+    components: list[Component],
+    purls: list[PackageURL | None],
+    fetch_deps: bool = True,
+) -> int:
+    """
+    Erstellt den CycloneDX Dependency Graph (bom.dependencies).
+
+    Für jeden Paketmanager mit API-Unterstützung werden direkte Abhängigkeiten
+    abgefragt und als Dependency-Edges eingetragen. Unbekannte Abhängigkeiten
+    (apk, deb) werden mit leerer Dependency-Liste registriert (Known Unknown).
+
+    Das Root-Component (Container-Image in metadata.component) wird als
+    abhängig von allen installierten Paketen eingetragen.
+
+    Gibt Anzahl der hinzugefügten Dependency-Edges zurück.
+    """
+    from cyclonedx.model.dependency import Dependency as CdxDependency
+
+    # Lookup-Tabelle: normalisierter Name → Component (für Dep-Name-Matching)
+    name_to_comp: dict[str, Component] = {}
+    for comp, purl in zip(components, purls):
+        if purl:
+            key = _normalize_pkg_name(purl.name, purl.type)
+            name_to_comp[key] = comp
+
+    total_edges = 0
+
+    if fetch_deps:
+        print(f'  Abhängigkeiten abrufen: {len(components)} Pakete ...', file=sys.stderr)
+
+        def _dep_kwargs(purl) -> dict:
+            """Extrahiert purl-Qualifier als kwargs für den Dep-Fetcher (z.B. distro für apk)."""
+            if purl.type == 'apk' and purl.qualifiers:
+                q = purl.qualifiers if isinstance(purl.qualifiers, dict) else {}
+                if 'distro' in q:
+                    return {'distro': q['distro']}
+            return {}
+
+        # Nur Pakete mit bekanntem Dep-Fetcher abfragen
+        fetchable = [
+            (purl.type, purl.name, comp.version, i, _dep_kwargs(purl))
+            for i, (comp, purl) in enumerate(zip(components, purls))
+            if purl and comp.version and purl.type in DEP_FETCHERS
+        ]
+
+        dep_map: dict[int, list[str]] = {}
+
+        def _fetch_dep_one(args):
+            purl_type, name, version, idx, kwargs = args
+            try:
+                return idx, DEP_FETCHERS[purl_type](name, version, **kwargs)
+            except TypeError:
+                return idx, DEP_FETCHERS[purl_type](name, version)
+
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for idx, deps in ex.map(_fetch_dep_one, fetchable):
+                dep_map[idx] = deps
+
+        # Dependency-Edges in BOM eintragen
+        for i, (comp, purl) in enumerate(zip(components, purls)):
+            if not purl:
+                bom.register_dependency(comp)
+                continue
+
+            dep_names = dep_map.get(i, [])
+            dep_comps: list[Component] = []
+
+            for dep_name in dep_names:
+                key = _normalize_pkg_name(dep_name, purl.type)
+                dep_comp = name_to_comp.get(key)
+                if dep_comp and dep_comp is not comp:
+                    dep_comps.append(dep_comp)
+
+            if dep_comps:
+                bom.register_dependency(comp, dep_comps)
+                total_edges += len(dep_comps)
+            else:
+                bom.register_dependency(comp)  # Known Unknown: Deps nicht ermittelbar
+
+    else:
+        # Alle Komponenten ohne Deps registrieren (fixiert die CycloneDX-Warning)
+        for comp in components:
+            bom.register_dependency(comp)
+
+    # Root-Component (Container-Image) hängt von allen installierten Paketen ab
+    if bom.metadata.component and components:
+        bom.register_dependency(bom.metadata.component, components)
+        total_edges += len(components)
+
+    return total_edges
+
+
+# ---------------------------------------------------------------------------
+# Hilfs-Cache-Key (geteilt zwischen Phase 3 + 4)
+# ---------------------------------------------------------------------------
 
 def _cache_key(purl_type: str, name: str, version: str) -> str:
     return f'{purl_type}:{name}@{version}'
@@ -666,7 +991,7 @@ def add_energy_to_bom(bom: Bom, energy_rows: list[dict]) -> int:
     return count
 
 
-def build_bom(run_id: str, fetch_licenses: bool = True) -> tuple[Bom, dict]:
+def build_bom(run_id: str, fetch_licenses: bool = True, fetch_deps: bool = True) -> tuple[Bom, dict]:
     """Liest einen GMT-Run aus der DB und erzeugt ein CycloneDX BOM."""
     db = DB()
 
@@ -704,12 +1029,8 @@ def build_bom(run_id: str, fetch_licenses: bool = True) -> tuple[Bom, dict]:
     # Phase 3: Lizenzen via externe Paketregistry-APIs
     license_count = apply_licenses_to_components(components, purls, fetch_licenses)
 
-    # -----------------------------------------------------------------------
-    # NTIA Known Unknowns:
-    # Abhängigkeitsbeziehungen (direkt vs. transitiv) sind in Phase 1 NICHT
-    # erfasst. CycloneDX compositions mit aggregate="not_complete_transitive"
-    # wird in Phase 4 (Dependency Graph) ergänzt.
-    # -----------------------------------------------------------------------
+    # Phase 4: Dependency Graph
+    dep_edges = build_dependency_graph(bom, components, purls, fetch_deps)
 
     meta = {
         'run_id':         str(run['id']),
@@ -719,6 +1040,7 @@ def build_bom(run_id: str, fetch_licenses: bool = True) -> tuple[Bom, dict]:
         'components':     len(components),
         'energy_metrics': energy_count,
         'licenses':       license_count,
+        'dep_edges':      dep_edges,
     }
 
     return bom, meta
@@ -761,6 +1083,10 @@ def main():
         '--no-licenses', action='store_true',
         help='Lizenz-Lookup via externe APIs überspringen (schneller, offline-fähig)',
     )
+    parser.add_argument(
+        '--no-deps', action='store_true',
+        help='Dependency-Graph-Lookup via externe APIs überspringen',
+    )
     args = parser.parse_args()
 
     if args.list_runs:
@@ -770,7 +1096,11 @@ def main():
     if not args.run_id:
         parser.error('--run-id ist erforderlich (oder --list-runs)')
 
-    bom, meta = build_bom(args.run_id, fetch_licenses=not args.no_licenses)
+    bom, meta = build_bom(
+        args.run_id,
+        fetch_licenses=not args.no_licenses,
+        fetch_deps=not args.no_deps,
+    )
 
     outputter = JsonV1Dot6(bom)
     json_str = outputter.output_as_string(indent=2)
@@ -781,6 +1111,7 @@ def main():
         print(f'Komponenten:      {meta["components"]}', file=sys.stderr)
         print(f'Energiemetriken:  {meta["energy_metrics"]}', file=sys.stderr)
         print(f'Lizenzen:         {meta["licenses"]}', file=sys.stderr)
+        print(f'Dep-Edges:        {meta["dep_edges"]}', file=sys.stderr)
         print(f'Run:              {meta["run_id"]}', file=sys.stderr)
         print(f'Erstellt:         {meta["created_at"]}', file=sys.stderr)
     else:
