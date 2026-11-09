@@ -40,7 +40,7 @@ PUBLIC_API = "https://api.green-coding.io"
 #   sum  : per-sample deltas (energy uJ, io bytes) summed over the window
 #   mean : levels (utilization, memory, frequency, temperature) averaged over samples in the window
 METRIC_MAP = [
-    (r"^psu_energy_ac_.*_machine$", "psu_energy_j", "sum_uj"),
+    (r"^psu_energy_ac_(?!xgboost).*_machine$", "psu_energy_j", "sum_uj"),  # xgboost = estimate, not a measurement
     (r"^cpu_energy_rapl_(msr|emi|scaphandre)_component$", "rapl_cpu_j", "sum_uj"),
     (r"^memory_energy_rapl_(msr|emi|scaphandre)_component$", "rapl_mem_j", "sum_uj"),
     (r"^cpu_utilization_(procfs|win32|mach|cgroup)_system$", "cpu_util_pct", "mean_ratio"),

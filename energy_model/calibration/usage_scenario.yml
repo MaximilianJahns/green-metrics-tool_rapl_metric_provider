@@ -9,6 +9,7 @@ description: >-
 services:
   calibration:
     image: gmt_calibration_stress
+    entrypoint: tail -f /dev/null
     build:
       context: .
 
