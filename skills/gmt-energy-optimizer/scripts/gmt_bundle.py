@@ -46,6 +46,9 @@ SPEC_KEYS = [
     "Virtualization", "Docker Virtual Machine",
 ]
 
+RAPL_SOURCE_PRIORITY = ["msr", "emi", "scaphandre"]
+CPU_UTIL_SYSTEM = ["cpu_utilization_procfs_system", "cpu_utilization_win32_system",
+                   "cpu_utilization_mach_system", "cpu_utilization_cgroup_system"]
 IDLE_CPU_PCT = 5.0        # CALIBRATE: fallback idle criterion when no baseline power exists
 IDLE_POWER_RATIO = 1.05   # CALIBRATE: phase power <= baseline power * this -> "mostly idle"
 NOISE_PCT = 5.0           # CALIBRATE: deltas below this are treated as measurement noise
@@ -70,7 +73,8 @@ def excess_w(attributable_j, duration_s):
 # ----------------------------------------------------------------------------
 
 class Api:
-    def __init__(self, cache_dir: Path, pause: float = 0.2, refresh: bool = False):
+    def __init__(self, cache_dir: Path, pause: float = 0.2, refresh: bool = False, base: str = None):
+        self.base = (base or API).rstrip("/")
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.pause = pause
@@ -85,7 +89,7 @@ class Api:
         cache = self.cache_dir / f"{key[:200]}.json"
         if cache.exists() and not self.refresh:
             return json.loads(cache.read_text(encoding="utf-8"))
-        r = self.s.get(API + path, params=params, timeout=90)
+        r = self.s.get(self.base + path, params=params, timeout=90)
         time.sleep(self.pause)
         if r.status_code == 204:
             data = None
@@ -96,6 +100,12 @@ class Api:
             data = r.json().get("data")
         cache.write_text(json.dumps(data), encoding="utf-8")
         return data
+
+
+def cache_dir_for(args):
+    """keep the existing cache for the public API, separate sub-cache for any other API"""
+    base = Path(args.cache)
+    return base if args.api.rstrip("/") == API else base / re.sub(r"[^A-Za-z0-9]+", "_", args.api)
 
 
 # ----------------------------------------------------------------------------
@@ -179,9 +189,15 @@ def choose_energy_scope(phase_stats):
     metrics = list((runtime.get("data") or {}).keys())
     for scope, rx in ENERGY_PRIORITY:
         if rx is None:
-            rapl = [m for m in metrics if re.match(r"^(cpu|memory)_energy_rapl_.*_component$", m)]
-            if rapl:
-                return scope, sorted(rapl)
+            # one RAPL source only (msr, emi, scaphandre ... may run in parallel -> never sum them)
+            by_src = defaultdict(list)
+            for m in metrics:
+                mm = re.match(r"^(cpu|memory)_energy_rapl_(.+)_component$", m)
+                if mm:
+                    by_src[mm.group(2)].append(m)
+            for src in RAPL_SOURCE_PRIORITY + sorted(by_src):
+                if any(m.startswith("cpu_") for m in by_src.get(src, [])):
+                    return f"rapl_{src}", sorted(by_src[src])
         else:
             hits = [m for m in metrics if rx.match(m)]
             if hits:
@@ -215,7 +231,11 @@ def summarize_run(run, phase_stats):
     for name, pobj in pdata.items():
         d = durations.get(name)
         e = phase_energy_j(pobj, energy_metrics) if energy_metrics else None
-        cpu_sys, _ = metric_sum(pobj, "cpu_utilization_procfs_system")
+        cpu_sys = None
+        for cm in CPU_UTIL_SYSTEM:
+            cpu_sys, _ = metric_sum(pobj, cm)
+            if cpu_sys is not None:
+                break
         cpu_ctr, _ = metric_by_detail(pobj, "cpu_utilization_cgroup_container")
         mem_ctr_mean, _ = metric_by_detail(pobj, "memory_used_cgroup_container", "mean")
         mem_ctr_max, _ = metric_by_detail(pobj, "memory_used_cgroup_container", "max")
@@ -557,7 +577,7 @@ def phase_comparison(summary_a, summary_b):
 
 
 def cmd_digest(args):
-    api = Api(Path(args.cache), args.pause, args.refresh)
+    api = Api(cache_dir_for(args), args.pause, args.refresh, args.api)
     softwares, page = [], 1
     while True:
         data = api.get("/v1/software", {"page": page})
@@ -636,7 +656,7 @@ def cmd_digest(args):
 # ----------------------------------------------------------------------------
 
 def cmd_run(args):
-    api = Api(Path(args.cache), args.pause, args.refresh)
+    api = Api(cache_dir_for(args), args.pause, args.refresh, args.api)
     rid = resolve_run_id(args.run_id, args.digest)
     run = api.get(f"/v2/run/{rid}")
     if not run:
@@ -950,7 +970,7 @@ def spearman(xs, ys):
 
 
 def cmd_cross(args):
-    api = Api(Path(args.cache), args.pause, args.refresh)
+    api = Api(cache_dir_for(args), args.pause, args.refresh, args.api)
     benches = [b.strip().lower() for b in args.benchmarks.split(",") if b.strip()]
     base = {"uri": args.uri, "uri_mode": "exact", "machine_id": args.machine_id, "failed": False, "limit": 50}
 
@@ -1282,6 +1302,7 @@ def resolve_run_id(rid, digest_path):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cache", default=".gmt_cache", help="directory for cached API responses")
+    p.add_argument("--api", default=API, help="GMT API base URL, e.g. http://api.green-coding.internal:9142 for a local GMT")
     p.add_argument("--pause", type=float, default=0.2, help="seconds between API calls")
     p.add_argument("--refresh", action="store_true", help="ignore cache")
     sub = p.add_subparsers(dest="cmd", required=True)

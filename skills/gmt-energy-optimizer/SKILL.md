@@ -22,8 +22,15 @@ matching Energy-ID slice from `energy_id_digest.json`:
 
 ```
 python scripts/gmt_bundle.py digest --out energy_id_digest.json      # once / weekly
-python scripts/gmt_bundle.py run <run_id> --digest energy_id_digest.json --out bundle.json
+python scripts/gmt_bundle.py cross --out cross_benchmark.json                # optional, per repo/machine
+python scripts/gmt_bundle.py run <run_id> --digest energy_id_digest.json [--cross cross_benchmark.json] --out bundle.json
+# ... the agent writes findings.json (Section 5.1) ...
+python scripts/gmt_report.py --bundle bundle.json --findings findings.json --out report.html
 ```
+
+After writing `findings.json`, always render the report with `scripts/gmt_report.py` and hand the
+HTML to the user: it shows the findings plus the energy split, the phase-by-phase comparison with
+alternatives, energy per unit of work, configuration tiers and the cross-benchmark factors.
 
 When a bundle is given: **quote its numbers, do not recompute them.** Units: J, W, s, bytes,
 g CO2e, CPU in percent. Compare only alternatives with `"comparable": true` numerically; all
