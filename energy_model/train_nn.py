@@ -359,6 +359,115 @@ def gmt_metrics(y_true, y_pred):
             "total_error_pct": float(100 * (np.sum(y_pred) - np.sum(y_true)) / np.sum(y_true))}
 
 
+# ---------------------------------------------------------------------------
+# Calibration to a target machine (GMT extension)
+# A model trained on other machines predicts the energy above baseline ("excess");
+# a short calibration recording of the target machine fits how that maps to the
+# target: offset = baseline only, scale = y_ex ~ k * p, linear = y_ex ~ a * p + b.
+# ---------------------------------------------------------------------------
+
+def gmt_fit_calibration(p_ex, y_ex, method):
+    p_ex = np.asarray(p_ex, dtype=np.float64)
+    y_ex = np.asarray(y_ex, dtype=np.float64)
+    if method == "offset" or len(p_ex) < 3:
+        return 1.0, 0.0
+    if method == "scale":
+        den = float(np.dot(p_ex, p_ex))
+        return (float(np.dot(p_ex, y_ex)) / den if den > 0 else 1.0), 0.0
+    if method == "linear":
+        if np.ptp(p_ex) < 1e-9:
+            return gmt_fit_calibration(p_ex, y_ex, "scale")
+        a, b = np.polyfit(p_ex, y_ex, 1)
+        return float(a), float(b)
+    raise ValueError(method)
+
+
+def gmt_apply_calibration(p_ex, coef):
+    a, b = coef
+    return np.clip(a * np.asarray(p_ex, dtype=np.float64) + b, 0.0, None)
+
+
+def gmt_pick_calibration(df_run, seconds, strategy, feats, seed=0):
+    """windows of ONE run used as calibration: first N seconds, or N windows spread over the load range"""
+    n = max(int(round(seconds / float(df_run["window_s"].median()))), 3)
+    if strategy == "first" or len(df_run) <= n:
+        return df_run.sort_values("t_s").head(n)
+    key = df_run[feats[0]].rank(method="first")
+    bins = pd.qcut(key, q=min(10, n), labels=False, duplicates="drop")
+    per = max(n // int(bins.nunique()), 1)
+    parts = [g.sample(min(len(g), per), random_state=seed) for _, g in df_run.groupby(bins)]
+    return pd.concat(parts).head(n)
+
+
+def gmt_predict_excess(model, scalers, df_x, feats, args, device):
+    """model prediction expressed as energy above the row's own baseline"""
+    x_scaler, y_scaler = scalers
+    X, _ = to_arrays(df_x, feats, args.log)
+    p = predict(model, x_scaler.transform(X), y_scaler, args.log, device)
+    if args.target_mode == "absolute":
+        p = p - df_x["__base_e__"].to_numpy(dtype=np.float64)
+    return p
+
+
+def gmt_calib_study(df, feats, args, device):
+    """leave-one-machine-out with a separate calibration run on the held-out machine"""
+    tcols, bcols = GMT_TARGETS[args.target]
+    df = df.copy()
+    df["__base_e__"] = df[bcols].sum(axis=1) * df["window_s"]
+    seconds = [float(x) for x in args.calib_seconds.split(",")]
+    strategies = [x.strip() for x in args.calib_strategy.split(",")]
+    methods = ["offset", "scale", "linear"]
+    rows = []
+    for g in sorted(df[args.group_col].astype(str).unique()):
+        m = df[args.group_col].astype(str) == g
+        d_tr, d_tg = df[~m].reset_index(drop=True), df[m].reset_index(drop=True)
+        runs = sorted(d_tg["run_id"].unique())
+        if len(runs) < 2:
+            print(f"skip {g}: needs >= 2 runs on the target (one for calibration)")
+            continue
+        print(f"\n### target {args.group_col}={g}: train on {len(d_tr)} windows, {len(runs)} target runs")
+        _, _, model, scalers = gmt_fit_predict(d_tr, d_tr.tail(5), feats, args, device)
+        # linear baseline model on the same training data, in excess space
+        X_tr, _ = to_arrays(d_tr, feats, args.log)
+        lin = LinearRegression().fit(X_tr, (d_tr["__y_abs__"] - d_tr["__base_e__"]).to_numpy())
+        for cal_run in runs[: args.calib_runs]:
+            d_cal_run = d_tg[d_tg["run_id"] == cal_run]
+            d_test = d_tg[d_tg["run_id"] != cal_run].reset_index(drop=True)
+            y = d_test["__y_abs__"].to_numpy(dtype=np.float64)
+            base = d_test["__base_e__"].to_numpy(dtype=np.float64)
+            preds = {"mlp": gmt_predict_excess(model, scalers, d_test, feats, args, device),
+                     "linear": lin.predict(to_arrays(d_test, feats, args.log)[0])}
+            for name, p in preds.items():
+                rows.append({"target": g, "cal_run": cal_run, "model": name, "method": "none", "seconds": 0,
+                             "strategy": "-", **gmt_metrics(y, np.clip(p, 0, None) + base)})
+            for sec in seconds:
+                for strat in strategies:
+                    cal = gmt_pick_calibration(d_cal_run, sec, strat, feats, seed=args.seed)
+                    y_cal = (cal["__y_abs__"] - cal["__base_e__"]).to_numpy()
+                    pc = {"mlp": gmt_predict_excess(model, scalers, cal, feats, args, device),
+                          "linear": lin.predict(to_arrays(cal, feats, args.log)[0])}
+                    for name, p in preds.items():
+                        for meth in methods:
+                            coef = gmt_fit_calibration(pc[name], y_cal, meth)
+                            rows.append({"target": g, "cal_run": cal_run, "model": name, "method": meth,
+                                         "seconds": sec, "strategy": strat, "a": coef[0], "b": coef[1],
+                                         **gmt_metrics(y, gmt_apply_calibration(p, coef) + base)})
+    res = pd.DataFrame(rows)
+    if res.empty:
+        print("no target with >= 2 runs")
+        return res
+    piv = (res.groupby(["model", "method", "seconds", "strategy", "target"])["WAPE_pct"].median()
+              .unstack("target").round(1))
+    piv["median"] = piv.median(axis=1).round(1)
+    with pd.option_context("display.width", 200, "display.max_rows", 200):
+        print("\nWAPE % on held-out target runs (median over calibration runs)\n")
+        print(piv)
+    if args.results:
+        res.to_csv(Path(args.results).with_suffix(".csv"), index=False)
+        print(f"\nall rows -> {Path(args.results).with_suffix('.csv')}")
+    return res
+
+
 def main_gmt(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -368,6 +477,10 @@ def main_gmt(args):
         print(f"--features {args.features} is a procpower set; using GMT set 'cpu'")
     df, feats = gmt_load([args.logfile], feats_name, args.target, args.target_mode, args.filter, args.phases)
     print(f"features: {feats} | target: {args.target} ({args.target_mode}) | device: {device}")
+
+    if args.split == "loo-calib":
+        gmt_calib_study(df, feats, args, device)
+        return
 
     results, pooled = [], {"y": [], "mlp": [], "lin": []}
     last = None
@@ -400,6 +513,21 @@ def main_gmt(args):
         df2, _ = gmt_load([args.predict], feats_name, args.target, args.target_mode, args.predict_filter, args.phases)
         mlp, lin, model, scalers = gmt_fit_predict(df, df2, feats, args, device)
         y2 = df2["__y_abs__"].to_numpy()
+        if args.calibrate:
+            tcols, bcols = GMT_TARGETS[args.target]
+            dc, _ = gmt_load([args.calibrate], feats_name, args.target, args.target_mode, None, None)
+            for d_ in (dc, df2):
+                d_["__base_e__"] = d_[bcols].sum(axis=1) * d_["window_s"]
+            p_cal = gmt_predict_excess(model, scalers, dc, feats, args, device)
+            coef = gmt_fit_calibration(p_cal, (dc["__y_abs__"] - dc["__base_e__"]).to_numpy(), args.calib_method)
+            p2 = gmt_predict_excess(model, scalers, df2, feats, args, device)
+            mlp_cal = gmt_apply_calibration(p2, coef) + df2["__base_e__"].to_numpy()
+            print(f"calibration ({args.calib_method}) from {args.calibrate}: a={coef[0]:.3f} b={coef[1]:.3f}")
+            print_metrics(f"MLP on {args.predict}, calibrated", y2, mlp_cal)
+            results.append({"fold": f"transfer->{args.predict} calibrated", "n_train": len(df), "n_val": len(df2),
+                            "calibration": {"method": args.calib_method, "a": coef[0], "b": coef[1]},
+                            "mlp": gmt_metrics(y2, mlp_cal), "linear": None})
+            mlp = mlp_cal
         print_metrics(f"MLP on {args.predict}", y2, mlp)
         print_metrics(f"Linear on {args.predict}", y2, lin)
         results.append({"fold": f"transfer->{args.predict}", "n_train": len(df), "n_val": len(df2),
@@ -575,7 +703,7 @@ if __name__ == "__main__":
                         help="procpower = energy-logger log (original), gmt = CSV from gmt_dataset.py")
     parser.add_argument("--target-mode", choices=["absolute", "excess"], default="absolute",
                         help="gmt: excess = learn energy above the machine's baseline power")
-    parser.add_argument("--split", choices=["time", "group", "loo"], default="time",
+    parser.add_argument("--split", choices=["time", "group", "loo", "loo-calib"], default="time",
                         help="gmt: time = original tail split, group = hold out --val-groups, loo = leave one group out")
     parser.add_argument("--group-col", default="scenario", help="gmt: column for group/loo split, e.g. dbms, benchmark, machine_id")
     parser.add_argument("--val-groups", default="", help="gmt: comma separated groups held out with --split group")
@@ -583,6 +711,11 @@ if __name__ == "__main__":
     parser.add_argument("--predict-filter", default="", help="gmt: pandas query on the --predict data")
     parser.add_argument("--phases", default="", help="gmt: keep only these phases, e.g. flow or [BASELINE],flow")
     parser.add_argument("--results", default="", help="gmt: write all fold metrics as JSON")
+    parser.add_argument("--calibrate", default="", help="gmt: calibration recording of the --predict machine")
+    parser.add_argument("--calib-method", choices=["offset", "scale", "linear"], default="scale")
+    parser.add_argument("--calib-seconds", default="60,120,300,600", help="gmt loo-calib: calibration lengths to test")
+    parser.add_argument("--calib-strategy", default="first,spread", help="gmt loo-calib: first = first N s, spread = N s over the load range")
+    parser.add_argument("--calib-runs", type=int, default=3, help="gmt loo-calib: target runs tried as calibration run")
 
     _args = parser.parse_args()
     if _args.format == "gmt":

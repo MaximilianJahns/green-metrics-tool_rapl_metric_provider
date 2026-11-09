@@ -71,5 +71,33 @@ python energy_model\train_nn.py data_laptop.csv.gz --format gmt --features cpu -
   --split loo --group-col run_id --results laptop_self.json
 ```
 
+## 5. Calibration to a new machine
+
+Power per % CPU utilization differs by up to 4x between machines (core count, CPU generation), while the
+relation on one machine is close to linear. A model trained on other machines therefore needs a short
+calibration recording of the target machine.
+
+**Calibration run** — `calibration/usage_scenario.yml` (+ `Dockerfile`): idle, 25/50/75/100 % CPU load on
+all cores, one core at 100 %, 50 % again, idle; 2 minutes per step, about 16 minutes. Run it with GMT on the
+target machine, then export it like any other run:
+
+```
+python energy_model\gmt_dataset.py --api http://api.green-coding.internal:9142 --runs <calibration run id> --out calib_laptop.csv.gz
+```
+
+**Apply it** — train on the cluster in `excess` mode, fit the calibration on the target recording, predict:
+
+```
+python energy_model\train_nn.py data_machines.csv.gz --format gmt --features cpu --target rapl_cpu_j ^
+  --target-mode excess --predict data_laptop.csv.gz --calibrate calib_laptop.csv.gz --calib-method scale
+```
+
+`--calib-method`: `offset` = only the target's own baseline, `scale` = one factor on the predicted excess
+energy, `linear` = factor and offset.
+
+**Study on existing data** — `--split loo-calib --group-col machine_id`: every machine is held out once;
+one of its runs serves as calibration (`--calib-runs`, `--calib-seconds 60,120,300,600`,
+`--calib-strategy first,spread`), all its other runs are the test set.
+
 Known limits: DBMS-bench runs on the cluster record only system CPU utilization, CPU frequency and
 temperature (no memory/disk/network); `custom_*` work metrics (energy per unit of work) are not exported yet.

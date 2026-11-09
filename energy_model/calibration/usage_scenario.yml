@@ -1,0 +1,70 @@
+---
+name: Energy model calibration (stepped CPU load)
+author: HTW Berlin, CASO
+description: >-
+  Stepped CPU load (idle, 25/50/75/100 % on all cores, one core 100 %, 50 % again, idle),
+  2 minutes per step, ~16 minutes. Gives baseline and slope of power vs. CPU utilization for
+  calibrating the energy model to a new machine (train_nn.py --calibrate).
+
+services:
+  calibration:
+    image: gmt_calibration_stress
+    build:
+      context: .
+
+flow:
+  - name: Idle
+    container: calibration
+    commands:
+      - type: console
+        command: sleep 120
+        note: no load
+
+  - name: Load all cores 25 pct
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 0 --cpu-load 25 --timeout 120s -q
+        note: 25 % on all cores
+
+  - name: Load all cores 50 pct
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 0 --cpu-load 50 --timeout 120s -q
+        note: 50 % on all cores
+
+  - name: Load all cores 75 pct
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 0 --cpu-load 75 --timeout 120s -q
+        note: 75 % on all cores
+
+  - name: Load all cores 100 pct
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 0 --cpu-load 100 --timeout 120s -q
+        note: 100 % on all cores
+
+  - name: Load one core 100 pct
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 1 --cpu-load 100 --timeout 120s -q
+        note: single-core boost
+
+  - name: Load all cores 50 pct again
+    container: calibration
+    commands:
+      - type: console
+        command: stress-ng --cpu 0 --cpu-load 50 --timeout 120s -q
+        note: repeat to see thermal drift
+
+  - name: Idle again
+    container: calibration
+    commands:
+      - type: console
+        command: sleep 120
+        note: cool-down
